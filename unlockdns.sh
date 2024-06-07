@@ -29,7 +29,7 @@ clear_rules() {
 
 # 查看白名单
 view_whitelist() {
-  if [ -f "$WHITELIST_FILE" ]; then
+  if ( -f "$WHITELIST_FILE" ]; then
     echo "白名单IP地址及对应的规则:"
     while IFS= read -r ip; do
       echo "白名单IP: $ip"
@@ -76,7 +76,8 @@ add_default_drop_rules() {
 reapply_whitelist() {
   remove_whitelist_rules
   remove_default_drop_rules
-  add_default_drop_rules
+  
+  # 添加白名单规则
   if [ -f "$WHITELIST_FILE" ]; then
     while IFS= read -r ip; do
       for PORT in "${PORTS[@]}"; do
@@ -85,6 +86,8 @@ reapply_whitelist() {
       done
     done < "$WHITELIST_FILE"
   fi
+  
+  add_default_drop_rules
 }
 
 # 创建存储规则的目录
@@ -100,13 +103,15 @@ save_rules() {
   create_rules_dir
   if command -v netfilter-persistent >/dev/null 2>&1; then
     netfilter-persistent save
+    netfilter-persistent reload
   elif command -v iptables-save >/dev/null 2>&1; then
     iptables-save > "$RULES_FILE_V4"
     ip6tables-save > "$RULES_FILE_V6"
     echo "iptables规则已保存到 ${RULES_FILE_V4} 和 ${RULES_FILE_V6}"
   elif command -v service >/dev/null 2>&1; then
     service iptables save
-    echo "iptables规则已保存到 /etc/sysconfig/iptables"
+    service iptables restart
+    echo "iptables规则已保存到 /etc/sysconfig/iptables 并重启服务"
   else
     echo "无法保存iptables规则，请手动检查您的系统配置"
   fi
