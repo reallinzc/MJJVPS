@@ -29,7 +29,7 @@ clear_rules() {
 
 # 查看白名单
 view_whitelist() {
-  if ( -f "$WHITELIST_FILE" ]; then
+  if [ -f "$WHITELIST_FILE" ]; then
     echo "白名单IP地址及对应的规则:"
     while IFS= read -r ip; do
       echo "白名单IP: $ip"
@@ -74,8 +74,8 @@ add_default_drop_rules() {
 
 # 重新添加白名单规则，保证优先级比禁用规则高
 reapply_whitelist() {
-  remove_whitelist_rules
-  remove_default_drop_rules
+  remove_whitelist_rules # 删除已有白名单
+  remove_default_drop_rules # 删除默认DROP规则
   
   # 添加白名单规则
   if [ -f "$WHITELIST_FILE" ]; then
@@ -87,7 +87,7 @@ reapply_whitelist() {
     done < "$WHITELIST_FILE"
   fi
   
-  add_default_drop_rules
+  add_default_drop_rules # 添加默认拒绝规则
 }
 
 # 创建存储规则的目录
