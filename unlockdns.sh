@@ -22,7 +22,7 @@ add_ip_to_whitelist() {
 # 清空规则
 clear_rules() {
   echo "清空iptables规则..."
-  iptables -F INPUT
+  iptables -F
   > "$WHITELIST_FILE"
   echo "规则已清空"
 }
@@ -40,6 +40,12 @@ view_whitelist() {
   else
     echo "白名单为空"
   fi
+}
+
+# 查看当前iptables规则
+view_current_rules() {
+  echo "当前iptables规则:"
+  iptables -L -v -n
 }
 
 # 删除现有的禁用规则
@@ -123,7 +129,8 @@ while true; do
   echo "1. 添加IP到白名单并放行多个端口(53, 80, 443)"
   echo "2. 清空iptables规则和白名单"
   echo "3. 查看白名单及对应规则"
-  echo "4. 退出"
+  echo "4. 查看当前iptables规则"
+  echo "5. 退出"
   echo -n "请选择一个操作: "
   read choice
   case $choice in
@@ -140,6 +147,9 @@ while true; do
       view_whitelist
       ;;
     4)
+      view_current_rules
+      ;;
+    5)
       break
       ;;
     *)
