@@ -51,18 +51,18 @@ unzip -q snell-server-*.zip
 # 停止现有的 Snell Server 服务（如果存在）
 if systemctl is-active --quiet snell-server; then
     echo -e "${GREEN}停止 Snell Server 服务...${NC}"
-    sudo systemctl stop snell-server
+    systemctl stop snell-server
 fi
 
 # 替换旧版本
 echo -e "${GREEN}替换 Snell Server...${NC}"
-sudo mv snell-server $SNELL_SERVER
-sudo chmod +x $SNELL_SERVER
+mv snell-server $SNELL_SERVER
+chmod +x $SNELL_SERVER
 
 # 重启 Snell Server 服务（如果存在）
 if systemctl list-unit-files | grep -q snell-server; then
     echo -e "${GREEN}重启 Snell Server 服务...${NC}"
-    sudo systemctl start snell-server
+    systemctl start snell-server
 fi
 
 # 清理临时文件
