@@ -31,7 +31,7 @@ case $ARCH in
 esac
 
 # 下载地址
-DOWNLOAD_URL="https://dl.nssurge.com/snell/snell-server-v5.0.0b3-linux-$ARCH_URL.zip"
+DOWNLOAD_URL="https://dl.nssurge.com/snell/snell-server-v5.0.0-linux-$ARCH_URL.zip"
 
 # 创建临时目录
 TMP_DIR=$(mktemp -d)
