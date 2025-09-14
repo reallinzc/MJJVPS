@@ -43,6 +43,38 @@ validate_ipv4() {
 
 validate_port() { local p=$1; [[ $p =~ ^[0-9]+$ ]] || return 1; (( p>=1 && p<=65535 )); }
 
+validate_domain() {
+  local domain=$1
+  [[ -z "$domain" ]] && return 1
+  [[ ${#domain} -gt 253 ]] && return 1
+  [[ "$domain" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]] || return 1
+  [[ "$domain" =~ \.\. ]] && return 1
+  [[ "$domain" =~ ^- ]] && return 1
+  [[ "$domain" =~ -$ ]] && return 1
+  return 0
+}
+
+resolve_domain() {
+  local domain=$1
+  local ip
+  
+  if have nslookup; then
+    ip=$(nslookup "$domain" 2>/dev/null | awk '/^Address: / && !/127\.0\.0\.1/ {print $2; exit}' | head -n1)
+  elif have dig; then
+    ip=$(dig +short "$domain" A 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n1)
+  elif have getent; then
+    ip=$(getent ahosts "$domain" 2>/dev/null | awk 'NR==1{print $1}')
+  else
+    return 1
+  fi
+  
+  if validate_ipv4 "$ip"; then
+    echo "$ip"
+    return 0
+  fi
+  return 1
+}
+
 http_get() {
   local url="$1"; local header="${2:-}"; local to="${3:-1}"
   if have curl; then
@@ -127,7 +159,7 @@ persist_rules_without_systemd() {
 
 # ---------- state & renderer ----------
 RULES_FILE=/etc/relay-rules.nft
-RULES_DB=/etc/relay-rules.db   # 每行：lport rport rip lip selftest(0/1)
+RULES_DB=/etc/relay-rules.db   # 每行：lport rport rip lip selftest(0/1) [domain]
 
 render_rules() {
   local hostip; hostip="$(hostname -I 2>/dev/null | awk '{print $1}')"
@@ -139,7 +171,7 @@ render_rules() {
     echo "  chain OUTPUT      { type nat hook output      priority -100; policy accept; }"
     echo "}"
     if [[ -s $RULES_DB ]]; then
-      while read -r lport rport rip lip selftest; do
+      while read -r lport rport rip lip selftest domain; do
         [[ -z "$lport" || "$lport" == \#* ]] && continue
         echo "add rule ip relay_nat PREROUTING tcp dport $lport counter dnat to $rip:$rport"
         echo "add rule ip relay_nat PREROUTING udp dport $lport counter dnat to $rip:$rport"
@@ -167,14 +199,20 @@ render_rules() {
 }
 
 add_relay_rule() {
-  local lport="$1" rip="$2" rport="$3" lip="$4" selftest="${5:-0}"
+  local lport="$1" rip="$2" rport="$3" lip="$4" selftest="${5:-0}" domain="${6:-}"
   mkdir -p "$(dirname "$RULES_DB")"; touch "$RULES_DB"
   local tmpf; tmpf="$(mktemp)"
   awk -v l="$lport" -v r="$rport" -v ip="$rip" '!(NF>=5 && $1==l && $2==r && $3==ip){print $0}' "$RULES_DB" > "$tmpf"
   mv "$tmpf" "$RULES_DB"
-  echo "$lport $rport $rip $lip $selftest" >> "$RULES_DB"
-  render_rules
-  ok "已添加/更新: $lport -> $rip:$rport (SNAT: $lip, selftest=$selftest)"
+  if [[ -n "$domain" ]]; then
+    echo "$lport $rport $rip $lip $selftest $domain" >> "$RULES_DB"
+    render_rules
+    ok "已添加/更新: $lport -> $domain($rip):$rport (SNAT: $lip, selftest=$selftest)"
+  else
+    echo "$lport $rport $rip $lip $selftest" >> "$RULES_DB"
+    render_rules
+    ok "已添加/更新: $lport -> $rip:$rport (SNAT: $lip, selftest=$selftest)"
+  fi
 }
 
 list_relay_rules() {
@@ -183,11 +221,11 @@ list_relay_rules() {
     echo "（当前无转发项）"
     return 1
   fi
-  printf "%-4s %-8s %-22s %-16s %-8s\n" "#" "LPORT" "REMOTE(RIP:RPORT)" "SNAT(LIP)" "SELFTEST"
+  printf "%-4s %-8s %-22s %-16s %-8s %-15s\n" "#" "LPORT" "REMOTE(RIP:RPORT)" "SNAT(LIP)" "SELFTEST" "DOMAIN"
   nl -w2 -s' ' "$RULES_DB" | awk '
     NF>=6{
-      idx=$1; lport=$2; rport=$3; rip=$4; lip=$5; self=$6
-      printf "%-4s %-8s %-22s %-16s %-8s\n", idx, lport, rip":"rport, lip, (self=="1"?"yes":"no")
+      idx=$1; lport=$2; rport=$3; rip=$4; lip=$5; self=$6; domain=$7
+      printf "%-4s %-8s %-22s %-16s %-8s %-15s\n", idx, lport, rip":"rport, lip, (self=="1"?"yes":"no"), (domain?domain:"")
     }'
   return 0
 }
@@ -212,6 +250,36 @@ delete_relay_rules_by_indices() {
 }
 
 clear_all_rules() { : > "$RULES_DB"; render_rules; ok "已清空所有转发项（表保留为空）"; }
+
+update_domain_ips() {
+  [[ ! -s $RULES_DB ]] && return 0
+  local tmpf; tmpf="$(mktemp)"
+  local updated=0
+  
+  while read -r lport rport rip lip selftest domain; do
+    [[ -z "$lport" || "$lport" == \#* ]] && { echo "$lport $rport $rip $lip $selftest $domain" >> "$tmpf"; continue; }
+    [[ -z "$domain" || "${#domain}" -eq 0 ]] && { echo "$lport $rport $rip $lip $selftest" >> "$tmpf"; continue; }
+    
+    local new_ip; new_ip="$(resolve_domain "$domain" 2>/dev/null || echo "$rip")"
+    if [[ "$new_ip" != "$rip" && -n "$new_ip" ]]; then
+      echo "$lport $rport $new_ip $lip $selftest $domain" >> "$tmpf"
+      info "域名 $domain IP更新: $rip -> $new_ip"
+      ((updated++))
+    else
+      echo "$lport $rport $rip $lip $selftest $domain" >> "$tmpf"
+    fi
+  done < "$RULES_DB"
+  
+  mv "$tmpf" "$RULES_DB"
+  
+  if (( updated > 0 )); then
+    render_rules
+    ok "已更新 $updated 个域名的IP地址"
+    return 0
+  else
+    return 1
+  fi
+}
 
 # ---------- guard / uninstall ----------
 disable_guard_timer() {
@@ -321,12 +389,13 @@ enable_tfo_optional() {
 install_guard_timer() {
   local svc="/etc/systemd/system/relay-rules-guard.service"
   local tim="/etc/systemd/system/relay-rules-guard.timer"
-  cat >"$svc" <<'EOF'
+  local script_path; script_path="$(realpath "$0" 2>/dev/null || echo "$0")"
+  cat >"$svc" <<EOF
 [Unit]
-Description=Guard: reload relay rules if table missing
+Description=Guard: reload relay rules if table missing and update domain IPs
 [Service]
 Type=oneshot
-ExecStart=/bin/sh -c 'nft list table ip relay_nat >/dev/null 2>&1 || /usr/bin/env nft -f /etc/relay-rules.nft'
+ExecStart=/bin/sh -c 'bash "$script_path" --guard-check'
 EOF
   cat >"$tim" <<'EOF'
 [Unit]
@@ -381,16 +450,38 @@ menu_root() {
     read -rp "选择: " ch
     case "$ch" in
       1)
-        local lport rport rip lip route_lip pub selftest yn
+        local lport rport rip lip route_lip pub selftest yn domain target_input
         while true; do read -rp "  本机监听端口 (1-65535): " lport; validate_port "${lport:-}" && break || echo "端口非法"; done
         while true; do read -rp "  目标端口 (1-65535): " rport; validate_port "${rport:-}" && break || echo "端口非法"; done
-        while true; do read -rp "  目标IPv4 (如: 192.0.2.5): " rip; validate_ipv4 "${rip:-}" && break || echo "IPv4非法"; done
+        
+        while true; do
+          read -rp "  目标地址 (IPv4 或 域名，如: 192.0.2.5 或 example.com): " target_input
+          [[ -z "$target_input" ]] && { echo "地址不能为空"; continue; }
+          
+          if validate_ipv4 "$target_input"; then
+            rip="$target_input"
+            domain=""
+            break
+          elif validate_domain "$target_input"; then
+            domain="$target_input"
+            rip="$(resolve_domain "$domain" 2>/dev/null || true)"
+            if [[ -n "$rip" ]]; then
+              info "域名 $domain 解析为: $rip"
+              break
+            else
+              echo "域名解析失败，请检查域名是否有效"
+            fi
+          else
+            echo "请输入有效的IPv4地址或域名"
+          fi
+        done
+        
         route_lip="$(ip -4 route get "$rip" 2>/dev/null | awk '/src/ {for (i=1;i<=NF;i++) if ($i=="src") print $(i+1)}' | head -n1 || true)"
         pub="$(detect_public_ipv4 || true)"
         echo "  探测: 公网IP(参考)=${pub:-未知}；路由出站IP=${route_lip:-未知}"
         while true; do read -rp "  本机出口IP (用于SNAT) [默认: ${route_lip:-请手动输入}]: " lip; lip="${lip:-$route_lip}"; validate_ipv4 "${lip:-}" && break || echo "IPv4非法"; done
         read -rp "  为本机自测添加 OUTPUT DNAT? [y/N]: " yn; [[ "${yn:-}" =~ ^[Yy]$ ]] && selftest=1 || selftest=0
-        add_relay_rule "$lport" "$rip" "$rport" "$lip" "$selftest"
+        add_relay_rule "$lport" "$rip" "$rport" "$lip" "$selftest" "$domain"
         if sysd_available; then persist_rules_with_systemd "$RULES_FILE"; else persist_rules_without_systemd "$RULES_FILE"; fi
         ;;
       2) echo; if list_relay_rules; then read -rp "  请输入要删除的编号（可空格分隔，如: 1 3 5）: " ids; delete_relay_rules_by_indices "$ids"; fi ;;
@@ -406,8 +497,25 @@ menu_root() {
   done
 }
 
+# ---------- guard check ----------
+guard_check() {
+  # 检查表是否存在，不存在则重新加载
+  if ! nft list table ip relay_nat >/dev/null 2>&1; then
+    nft -f /etc/relay-rules.nft 2>/dev/null || true
+  fi
+  
+  # 更新域名IP
+  update_domain_ips >/dev/null 2>&1 || true
+}
+
 # ---------- main ----------
 main() {
+  # 处理guard-check参数
+  if [[ "${1:-}" == "--guard-check" ]]; then
+    guard_check
+    exit 0
+  fi
+  
   require_root
   ensure_nft
   enable_ip_forward
