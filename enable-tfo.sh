@@ -25,16 +25,33 @@ write_sysctl_file(){
   sysctl -p "$file" >/dev/null || true
 }
 
-# 读取 /proc/net/netstat 中的 TFO 计数
+# 读取 /proc/net/netstat 中的 TFO 计数（健壮版：解析键名-数值成对行）
 read_tfo_counters(){
   # 输出：ACTIVE PASSIVE 两列
   if [[ -r /proc/net/netstat ]]; then
-    local A P
-    A=$(awk '/TCPFastOpenActive/{print $2}' /proc/net/netstat 2>/dev/null | tail -n1)
-    P=$(awk '/TCPFastOpenPassive/{print $2}' /proc/net/netstat 2>/dev/null | tail -n1)
-    [[ -z "$A" ]] && A=0
-    [[ -z "$P" ]] && P=0
-    echo "$A $P"
+    awk '
+      $1=="TcpExt:" {
+        # 第一行是键名
+        delete key; delete val
+        for (i=2; i<=NF; i++) key[i]=$i
+        # 下一行是对应的数值
+        if (getline > 0) {
+          for (i=2; i<=NF; i++) val[i]=$i
+          active=passive=""
+          for (i in key) {
+            if (key[i]=="TCPFastOpenActive")  active=val[i]
+            if (key[i]=="TCPFastOpenPassive") passive=val[i]
+          }
+          if (active!="")  lastA=active
+          if (passive!="") lastP=passive
+        }
+      }
+      END {
+        if (lastA=="") lastA=0
+        if (lastP=="") lastP=0
+        print lastA, lastP
+      }
+    ' /proc/net/netstat
   else
     echo "0 0"
   fi
@@ -45,7 +62,11 @@ ensure_tfo_key(){
   local key_file="/proc/sys/net/ipv4/tcp_fastopen_key"
   if [[ -w "$key_file" ]]; then
     local KEY
-    KEY="$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    if command -v openssl >/dev/null 2>&1; then
+      KEY="$(openssl rand -hex 16)"
+    else
+      KEY="$(head -c 16 /dev/urandom | od -An -tx1 | tr -d " \n")"
+    fi
     echo "$KEY" > "$key_file" 2>/dev/null || true
     echo "$KEY"
   else
