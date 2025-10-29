@@ -1,182 +1,495 @@
 #!/usr/bin/env bash
-# relay_optional_snat.sh — nftables relay with per-rule optional SNAT (IPv4 only)
-# 结构与 A 类似，区别：DB 增加 snat 开关与 SNAT 源 IP；渲染时按规则决定是否 POSTROUTING SNAT
+# relay.sh — nftables relay manager (compatible with nft v1.1.3)
+# Author: ChatGPT
+# Features:
+# - 独立 NAT 表 relay_nat，声明式/幂等渲染（文件不写 flush；加载前 delete 再 -f）
+# - 新增/删除（按编号）、查看、清空、重渲染、完全卸载
+# - 一键：内核转发 + conntrack 调优 (+ 可选 TFO) + 规则守护 timer
+# - SNAT 默认=route 决定的 src；OUTPUT 自测覆盖 TCP/UDP
+# - 兼容老版本 nft（v1.1.3）：避免 “flush table … not found” 报错
+
 set -euo pipefail
 
-# —— 通用辅助函数（与 A 基本一致，省略重复注释） ——
-err(){ echo "ERROR: $*" >&2; } ; info(){ echo "[*] $*"; } ; ok(){ echo "[OK] $*"; } ; warn(){ echo "[WARN] $*"; }
-have(){ command -v "$1" >/dev/null 2>&1; } ; require_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || { err "请以 root 运行"; exit 1; }; }
-validate_ipv4(){ local ip=$1; [[ $ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1; IFS=. read -r a b c d <<<"$ip"; for n in $a $b $c $d; do ((n>=0&&n<=255)) || return 1; done; }
-validate_port(){ local p=$1; [[ $p =~ ^[0-9]+$ ]] && ((p>=1&&p<=65535)); }
-validate_domain(){ local d=$1; [[ -n $d && ${#d} -le 253 && $d =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ && ! $d =~ \.\. && ! $d =~ ^- && ! $d =~ -$ ]]; }
-resolve_domain(){ local domain=$1 ip=""; if have getent; then ip=$(getent ahostsv4 "$domain" 2>/dev/null | awk 'NF{print $1; exit}'); fi; if ! validate_ipv4 "${ip:-}"; then if have dig; then ip=$(dig +short A "$domain" 2>/dev/null | awk 'NF{print; exit}'); fi; fi; if ! validate_ipv4 "${ip:-}"; then if have nslookup; then ip=$(nslookup -type=A "$domain" 2>/dev/null | awk '/Address: /{print $2}' | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n1); fi; fi; validate_ipv4 "${ip:-}" && { echo "$ip"; return 0; } || return 1; }
-sysd_available(){ [[ -d /run/systemd/system ]] && have systemctl; }
-write_sysctl(){ local f="$1"; shift; mkdir -p /etc/sysctl.d; : >"$f"; for kv in "$@"; do echo "$kv" >>"$f"; done; sysctl -p "$f" >/dev/null 2>&1 || true; }
-enable_kernel_forward_pack(){ write_sysctl "/etc/sysctl.d/99-relay-kernel.conf" "net.ipv4.ip_forward=1" "net.ipv4.conf.all.rp_filter=0" "net.ipv4.conf.default.rp_filter=0" "net.ipv4.conf.all.accept_redirects=0" "net.ipv4.conf.default.accept_redirects=0" "net.ipv4.conf.all.send_redirects=0" "net.ipv4.conf.default.send_redirects=0"; ok "已开启转发"; }
-compute_ct_max(){ awk '/MemTotal/ {m=$2; exit} END{if(m=="") m=1048576; print (m/8<262144?262144:(m/8>2097152?2097152:m/8)) }' /proc/meminfo; }
-tune_conntrack_balanced(){ local max; max=$(compute_ct_max); write_sysctl "/etc/sysctl.d/99-conntrack-relay.conf" "net.netfilter.nf_conntrack_max=${max}" "net.netfilter.nf_conntrack_tcp_timeout_close=10" "net.netfilter.nf_conntrack_tcp_timeout_close_wait=120" "net.netfilter.nf_conntrack_tcp_timeout_fin_wait=120" "net.netfilter.nf_conntrack_tcp_timeout_last_ack=60" "net.netfilter.nf_conntrack_tcp_timeout_syn_recv=60" "net.netfilter.nf_conntrack_tcp_timeout_syn_sent=120" "net.netfilter.nf_conntrack_tcp_timeout_time_wait=120" "net.netfilter.nf_conntrack_tcp_timeout_unacknowledged=300" "net.netfilter.nf_conntrack_tcp_timeout_established=1800" "net.netfilter.nf_conntrack_udp_timeout=60" "net.netfilter.nf_conntrack_udp_timeout_stream=300"; ok "conntrack（均衡）已应用"; }
-tune_conntrack_aggressive(){ local max; max=$(compute_ct_max); write_sysctl "/etc/sysctl.d/99-conntrack-relay.conf" "net.netfilter.nf_conntrack_max=${max}" "net.netfilter.nf_conntrack_tcp_timeout_close=5" "net.netfilter.nf_conntrack_tcp_timeout_close_wait=30" "net.netfilter.nf_conntrack_tcp_timeout_fin_wait=30" "net.netfilter.nf_conntrack_tcp_timeout_last_ack=15" "net.netfilter.nf_conntrack_tcp_timeout_syn_recv=20" "net.netfilter.nf_conntrack_tcp_timeout_syn_sent=20" "net.netfilter.nf_conntrack_tcp_timeout_time_wait=15" "net.netfilter.nf_conntrack_tcp_timeout_unacknowledged=60" "net.netfilter.nf_conntrack_tcp_timeout_established=300" "net.netfilter.nf_conntrack_udp_timeout=10" "net.netfilter.nf_conntrack_udp_timeout_stream=60"; ok "conntrack（激进）已应用"; }
-persist_rules_with_systemd(){ local rf="$1" svc=/etc/systemd/system/relay-rules.service; cat >"$svc"<<EOF
-[Unit] Description=Load relay_nat rules
+# ---------- helpers ----------
+err() { echo "ERROR: $*" >&2; }
+info() { echo "[*] $*"; }
+ok() { echo "[OK] $*"; }
+warn() { echo "[WARN] $*"; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+require_root() {
+  if [[ ${EUID:-$(id -u)} -ne 0 ]]; then err "请以 root 身份运行 (sudo bash relay.sh)"; exit 1; fi
+}
+
+detect_pkgmgr() {
+  if have apt; then echo apt; return; fi
+  if have dnf; then echo dnf; return; fi
+  if have yum; then echo yum; return; fi
+  if have pacman; then echo pacman; return; fi
+  echo none
+}
+
+sysd_available() {
+  if have systemctl && systemctl list-units >/dev/null 2>&1; then return 0; fi
+  return 1
+}
+
+validate_ipv4() {
+  local ip=$1
+  [[ $ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  IFS=. read -r a b c d <<<"$ip"
+  for n in $a $b $c $d; do (( n>=0 && n<=255 )) || return 1; done
+}
+
+validate_port() { local p=$1; [[ $p =~ ^[0-9]+$ ]] || return 1; (( p>=1 && p<=65535 )); }
+
+validate_domain() {
+  local domain=$1
+  [[ -z "$domain" ]] && return 1
+  [[ ${#domain} -gt 253 ]] && return 1
+  [[ "$domain" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]] || return 1
+  [[ "$domain" =~ \.\. ]] && return 1
+  [[ "$domain" =~ ^- ]] && return 1
+  [[ "$domain" =~ -$ ]] && return 1
+  return 0
+}
+
+resolve_domain() {
+  local domain=$1
+  local ip
+  
+  if have nslookup; then
+    ip=$(nslookup "$domain" 2>/dev/null | awk '/^Address: / && !/127\.0\.0\.1/ {print $2; exit}' | head -n1)
+  elif have dig; then
+    ip=$(dig +short "$domain" A 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n1)
+  elif have getent; then
+    ip=$(getent ahosts "$domain" 2>/dev/null | awk 'NR==1{print $1}')
+  else
+    return 1
+  fi
+  
+  if validate_ipv4 "$ip"; then
+    echo "$ip"
+    return 0
+  fi
+  return 1
+}
+
+http_get() {
+  local url="$1"; local header="${2:-}"; local to="${3:-1}"
+  if have curl; then
+    if [[ -n "$header" ]]; then curl -fsS --max-time "$to" -H "$header" "$url" 2>/dev/null || true
+    else curl -fsS --max-time "$to" "$url" 2>/dev/null || true; fi
+  elif have wget; then
+    if [[ -n "$header" ]]; then wget -qO- --timeout="$to" --header="$header" "$url" 2>/dev/null || true
+    else wget -qO- --timeout="$to" "$url" 2>/dev/null || true; fi
+  fi
+}
+
+detect_public_ipv4() {
+  local ip cand
+  while read -r cand; do ip="${cand%/*}"; validate_ipv4 "$ip" && { echo "$ip"; return 0; }; done \
+    < <(ip -4 -o addr show scope global up | awk '{print $4}')
+  ip="$(http_get 'https://api.ipify.org' '' 2)"
+  validate_ipv4 "$ip" && echo "$ip" && return 0
+  return 1
+}
+
+ensure_nft() {
+  if have nft; then ok "nft 已安装：$(nft --version | head -n1)"; return; fi
+  local pm; pm=$(detect_pkgmgr)
+  [[ $pm == none ]] && { err "找不到包管理器，请手动安装 nftables"; exit 1; }
+  info "安装 nftables…"
+  case "$pm" in
+    apt) apt update -y && apt install -y nftables ;;
+    dnf) dnf install -y nftables ;;
+    yum) yum install -y nftables ;;
+    pacman) pacman -Sy --noconfirm nftables ;;
+  esac
+  ok "nftables 安装完成"
+}
+
+enable_ip_forward() {
+  mkdir -p /etc/sysctl.d
+  echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-ipforward.conf
+  sysctl -w net.ipv4/ip_forward=1 >/dev/null 2>&1 || sysctl -w net.ipv4.ip_forward=1 >/dev/null
+  ok "已开启 IPv4 转发"
+}
+
+check_conflicts() {
+  if have ufw && systemctl is-active --quiet ufw; then
+    warn "UFW 正在运行，可能与 nftables 规则冲突： systemctl stop ufw && systemctl disable ufw"
+  fi
+  if have iptables && iptables --version 2>/dev/null | grep -q nf_tables; then
+    info "检测到 iptables 使用 nftables 后端 (iptables-nft)。"
+  fi
+}
+
+persist_rules_with_systemd() {
+  local rules_file=$1
+  local svc=/etc/systemd/system/relay-rules.service
+  cat >"$svc" <<EOF
+[Unit]
+Description=Load relay NAT rules (relay_nat)
 After=network-online.target
 Wants=network-online.target
-[Service] Type=oneshot
-ExecStart=/usr/bin/env nft -f $rf
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/env nft -f $rules_file
 RemainAfterExit=yes
-[Install] WantedBy=multi-user.target
-EOF
-  systemctl daemon-reload; systemctl enable --now relay-rules.service; ok "已持久化并加载规则"; }
-install_guard_timer(){ local svc=/etc/systemd/system/relay-rules-guard.service; local tim=/etc/systemd/system/relay-rules-guard.timer; local self; self="$(realpath "$0" 2>/dev/null || echo "$0")"; cat >"$svc"<<EOF
-[Unit] Description=Guard: reload relay rules & update domain IPs
-[Service] Type=oneshot
-ExecStart=/bin/sh -c 'bash "$self" --guard-check'
-EOF
-  cat >"$tim"<<'EOF'
-[Unit] Description=Guard timer for relay_nat
-[Timer] OnUnitActiveSec=1min
-AccuracySec=15s
-Unit=relay-rules-guard.service
-[Install] WantedBy=timers.target
-EOF
-  systemctl daemon-reload; systemctl enable --now relay-rules-guard.timer; ok "已安装守护 timer"; }
-disable_guard_timer(){ systemctl disable --now relay-rules-guard.timer 2>/dev/null || true; rm -f /etc/systemd/system/relay-rules-guard.{service,timer}; systemctl daemon-reload || true; ok "已移除守护 timer"; }
 
-# —— 状态 & 渲染 ——
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable relay-rules.service
+  systemctl start relay-rules.service
+  ok "已通过 systemd 持久化并加载规则"
+}
+
+persist_rules_without_systemd() {
+  local rules_file=$1
+  local conf=/etc/nftables.conf
+  touch "$conf"
+  grep -qF "include \"$rules_file\"" "$conf" || printf '\n# relay rules\ninclude "%s"\n' "$rules_file" >> "$conf"
+  nft -f "$conf"
+  ok "已写入 $conf 并立即加载 (无 systemd 环境)"
+}
+
+# ---------- state & renderer ----------
 RULES_FILE=/etc/relay-rules.nft
-RULES_DB=/etc/relay-rules.db   # 行格式：lport rport rip snat[0/1] lip selftest[0/1] [domain]
+RULES_DB=/etc/relay-rules.db   # 每行：lport rport rip lip selftest(0/1) [domain]
 
-render_rules(){
+render_rules() {
+  local hostip; hostip="$(hostname -I 2>/dev/null | awk '{print $1}')"
   {
+    echo "# Auto-generated by relay.sh at $(date '+%F %T')"
     echo "table ip relay_nat {"
     echo "  chain PREROUTING { type nat hook prerouting priority -100; policy accept; }"
     echo "  chain POSTROUTING { type nat hook postrouting priority 100; policy accept; }"
     echo "  chain OUTPUT      { type nat hook output      priority -100; policy accept; }"
     echo "}"
-    [[ -s $RULES_DB ]] && while read -r lport rport rip snat lip selftest domain; do
-      [[ -z "${lport:-}" || "$lport" =~ ^# ]] && continue
-      echo "add rule ip relay_nat PREROUTING tcp dport $lport counter dnat to $rip:$rport"
-      echo "add rule ip relay_nat PREROUTING udp dport $lport counter dnat to $rip:$rport"
-      if [[ "${snat:-0}" == "1" ]]; then
+    if [[ -s $RULES_DB ]]; then
+      while read -r lport rport rip lip selftest domain; do
+        [[ -z "$lport" || "$lport" == \#* ]] && continue
+        echo "add rule ip relay_nat PREROUTING tcp dport $lport counter dnat to $rip:$rport"
+        echo "add rule ip relay_nat PREROUTING udp dport $lport counter dnat to $rip:$rport"
         echo "add rule ip relay_nat POSTROUTING ip daddr $rip tcp dport $rport counter snat to $lip"
         echo "add rule ip relay_nat POSTROUTING ip daddr $rip udp dport $rport counter snat to $lip"
-      fi
-      if [[ "${selftest:-0}" == "1" ]]; then
-        echo "add rule ip relay_nat OUTPUT ip daddr 127.0.0.1 tcp dport $lport counter dnat to $rip:$rport"
-        echo "add rule ip relay_nat OUTPUT ip daddr 127.0.0.1 udp dport $lport counter dnat to $rip:$rport"
-      fi
-    done <"$RULES_DB"
-  } >"$RULES_FILE"
+        if [[ "${selftest:-0}" == "1" ]]; then
+          if [[ -n "$hostip" ]]; then
+            echo "add rule ip relay_nat OUTPUT ip daddr $hostip tcp dport $lport counter dnat to $rip:$rport"
+            echo "add rule ip relay_nat OUTPUT ip daddr $hostip udp dport $lport counter dnat to $rip:$rport"
+          fi
+          echo "add rule ip relay_nat OUTPUT ip daddr 127.0.0.1 tcp dport $lport counter dnat to $rip:$rport"
+          echo "add rule ip relay_nat OUTPUT ip daddr 127.0.0.1 udp dport $lport counter dnat to $rip:$rport"
+        fi
+      done < "$RULES_DB"
+    fi
+  } > "$RULES_FILE"
+
+  # 兼容 nft v1.1.3：先删（忽略错误）再加载（文件不写 flush）
   nft delete table ip relay_nat 2>/dev/null || true
   nft -f "$RULES_FILE"
-  ok "已渲染并应用规则（含可选 SNAT）"
+
+  local cnt=0
+  [[ -s $RULES_DB ]] && cnt=$(awk 'NF>=5{c++}END{print c+0}' "$RULES_DB")
+  ok "已渲染并应用 relay_nat 规则（$cnt 条转发项）"
 }
 
-add_rule(){
-  local lport="$1" rport="$2" rip="$3" snat="$4" lip="$5" selftest="$6" domain="${7:-}"
+add_relay_rule() {
+  local lport="$1" rip="$2" rport="$3" lip="$4" selftest="${5:-0}" domain="${6:-}"
   mkdir -p "$(dirname "$RULES_DB")"; touch "$RULES_DB"
-  local tmp; tmp=$(mktemp)
-  awk -v l="$lport" -v r="$rport" -v ip="$rip" '!(NF>=6 && $1==l && $2==r && $3==ip){print $0}' "$RULES_DB" >"$tmp"
-  mv "$tmp" "$RULES_DB"
+  local tmpf; tmpf="$(mktemp)"
+  awk -v l="$lport" -v r="$rport" -v ip="$rip" '!(NF>=5 && $1==l && $2==r && $3==ip){print $0}' "$RULES_DB" > "$tmpf"
+  mv "$tmpf" "$RULES_DB"
   if [[ -n "$domain" ]]; then
-    echo "$lport $rport $rip $snat $lip $selftest $domain" >>"$RULES_DB"
-    ok "已添加/更新: $lport -> $domain($rip):$rport SNAT=$snat($lip) selftest=$selftest"
+    echo "$lport $rport $rip $lip $selftest $domain" >> "$RULES_DB"
+    render_rules
+    ok "已添加/更新: $lport -> $domain($rip):$rport (SNAT: $lip, selftest=$selftest)"
   else
-    echo "$lport $rport $rip $snat $lip $selftest" >>"$RULES_DB"
-    ok "已添加/更新: $lport -> $rip:$rport SNAT=$snat($lip) selftest=$selftest"
+    echo "$lport $rport $rip $lip $selftest" >> "$RULES_DB"
+    render_rules
+    ok "已添加/更新: $lport -> $rip:$rport (SNAT: $lip, selftest=$selftest)"
   fi
+}
+
+list_relay_rules() {
+  # 正确的空表检测：存在任意一行满足 NF>=5 即视为非空
+  if [[ ! -s $RULES_DB ]] || ! awk 'NF>=5{found=1; exit} END{exit !found}' "$RULES_DB" 2>/dev/null; then
+    echo "（当前无转发项）"
+    return 1
+  fi
+  printf "%-4s %-8s %-22s %-16s %-8s %-15s\n" "#" "LPORT" "REMOTE(RIP:RPORT)" "SNAT(LIP)" "SELFTEST" "DOMAIN"
+  nl -w2 -s' ' "$RULES_DB" | awk '
+    NF>=6{
+      idx=$1; lport=$2; rport=$3; rip=$4; lip=$5; self=$6; domain=$7
+      printf "%-4s %-8s %-22s %-16s %-8s %-15s\n", idx, lport, rip":"rport, lip, (self=="1"?"yes":"no"), (domain?domain:"")
+    }'
+  return 0
+}
+
+delete_relay_rules_by_indices() {
+  local indices="$1"
+  [[ -z "$indices" ]] && { warn "未提供编号"; return 1; }
+  [[ ! -s $RULES_DB ]] && { warn "无规则可删"; return 1; }
+  indices="$(echo "$indices" | tr ',' ' ' | xargs 2>/dev/null || true)"
+  [[ -z "$indices" ]] && { warn "编号解析失败"; return 1; }
+
+  local before after tmpf
+  before=$(awk 'NF>=5{c++}END{print c+0}' "$RULES_DB")
+  tmpf="$(mktemp)"
+  awk -v idxs="$indices" 'BEGIN{split(idxs,a," "); for(i in a) if(a[i]~/^[0-9]+$/) del[a[i]]=1; row=0}
+    NF>=5{row++; if(!del[row]) print $0; next}
+    {print $0}' "$RULES_DB" > "$tmpf"
+  mv "$tmpf" "$RULES_DB"
   render_rules
+  after=$(awk 'NF>=5{c++}END{print c+0}' "$RULES_DB")
+  ok "已删除指定编号规则：共删 $(($before - $after)) 条；当前剩余 $after 条。"
 }
 
-list_rules(){
-  if ! awk 'NF>=6{found=1; exit} END{exit !found}' "$RULES_DB" 2>/dev/null; then
-    echo "（当前无转发项）"; return 1; fi
-  printf "%-4s %-8s %-22s %-6s %-16s %-8s %-15s\n" "#" "LPORT" "REMOTE" "SNAT" "LIP" "SELF" "DOMAIN"
-  nl -w2 -s' ' "$RULES_DB" | while read -r idx lport rport rip snat lip self domain; do
-    [[ -z "${idx:-}" || -z "${rip:-}" ]] && continue
-    printf "%-4s %-8s %-22s %-6s %-16s %-8s %-15s\n" "$idx" "$lport" "$rip:$rport" "$([[ $snat == 1 ]] && echo yes || echo no)" "$lip" "$([[ $self == 1 ]] && echo yes || echo no)" "${domain:-}"
-  done
-}
+clear_all_rules() { : > "$RULES_DB"; render_rules; ok "已清空所有转发项（表保留为空）"; }
 
-delete_by_indices(){
-  local idxs="$1"; [[ -z $idxs ]] && { warn "未提供编号"; return 1; }
-  local tmp; tmp=$(mktemp)
-  awk -v del="$(echo "$idxs" | tr ',' ' ')" 'BEGIN{split(del,a," "); for(i in a) if(a[i]~/^[0-9]+$/) D[a[i]]=1} {row++; if(!D[row]) print $0}' "$RULES_DB" >"$tmp"
-  mv "$tmp" "$RULES_DB"; render_rules; ok "已按编号删除并重载"
-}
-
-clear_all(){ : >"$RULES_DB"; render_rules; ok "已清空所有转发项"; }
-
-update_domain_ips(){
-  [[ -s $RULES_DB ]] || return 0
-  local tmp; tmp=$(mktemp); local updated=0
-  while read -r lport rport rip snat lip self domain; do
-    [[ -z ${lport:-} || "$lport" =~ ^# ]] && { echo "$lport $rport $rip $snat $lip $self $domain" >>"$tmp"; continue; }
-    [[ -z ${domain:-} ]] && { echo "$lport $rport $rip $snat $lip $self" >>"$tmp"; continue; }
-    local new; new="$(resolve_domain "$domain" 2>/dev/null || echo "$rip")"
-    if [[ "$new" != "$rip" && -n "$new" ]]; then
-      echo "$lport $rport $new $snat $lip $self $domain" >>"$tmp"; updated=$((updated+1)); info "域名 $domain 更新: $rip -> $new"
+update_domain_ips() {
+  [[ ! -s $RULES_DB ]] && return 0
+  local tmpf; tmpf="$(mktemp)"
+  local updated=0
+  
+  while read -r lport rport rip lip selftest domain; do
+    [[ -z "$lport" || "$lport" == \#* ]] && { echo "$lport $rport $rip $lip $selftest $domain" >> "$tmpf"; continue; }
+    [[ -z "$domain" || "${#domain}" -eq 0 ]] && { echo "$lport $rport $rip $lip $selftest" >> "$tmpf"; continue; }
+    
+    local new_ip; new_ip="$(resolve_domain "$domain" 2>/dev/null || echo "$rip")"
+    if [[ "$new_ip" != "$rip" && -n "$new_ip" ]]; then
+      echo "$lport $rport $new_ip $lip $selftest $domain" >> "$tmpf"
+      info "域名 $domain IP更新: $rip -> $new_ip"
+      ((updated++))
     else
-      echo "$lport $rport $rip $snat $lip $self $domain" >>"$tmp"
+      echo "$lport $rport $rip $lip $selftest $domain" >> "$tmpf"
     fi
-  done <"$RULES_DB"
-  mv "$tmp" "$RULES_DB"; ((updated>0)) && { render_rules; ok "已更新 $updated 个域名 IP"; }
+  done < "$RULES_DB"
+  
+  mv "$tmpf" "$RULES_DB"
+  
+  if (( updated > 0 )); then
+    render_rules
+    ok "已更新 $updated 个域名的IP地址"
+    return 0
+  else
+    return 1
+  fi
 }
 
-guard_check(){ nft list table ip relay_nat >/dev/null 2>&1 || nft -f "$RULES_FILE" 2>/dev/null || true; update_domain_ips >/dev/null 2>&1 || true; }
+# ---------- guard / uninstall ----------
+disable_guard_timer() {
+  local tim="/etc/systemd/system/relay-rules-guard.timer"
+  local svc="/etc/systemd/system/relay-rules-guard.service"
+  systemctl disable --now relay-rules-guard.timer 2>/dev/null || true
+  rm -f "$tim" "$svc"
+  systemctl daemon-reload
+  ok "已关闭并移除规则守护定时器"
+}
 
-menu_oneclick(){
-  echo; echo "== 一键：开启转发 + conntrack 调优 =="
+uninstall_all() {
+  nft delete table ip relay_nat 2>/dev/null || true
+  rm -f "$RULES_FILE" "$RULES_DB"
+  if sysd_available; then
+    systemctl disable --now relay-rules.service 2>/dev/null || true
+    rm -f /etc/systemd/system/relay-rules.service
+    systemctl daemon-reload || true
+  fi
+  disable_guard_timer
+  ok "已卸载服务并删除所有文件"
+}
+
+show_detected_ips() {
+  local pub iplist
+  pub="$(detect_public_ipv4 || true)"
+  iplist="$(ip -4 -o addr show scope global up | awk '{print $2,$4}' | sed 's#/.*##')"
+  echo "—— 本机 IPv4 概览 ——"
+  echo "  公网IPv4(参考): ${pub:-未知}"
+  echo "  本机地址列表: "; [[ -n "$iplist" ]] && echo "$iplist" | sed 's/^/    - /' || echo "    - 无"
+  echo "——————————————"
+}
+
+# ---------- kernel / conntrack / TFO / guard ----------
+write_sysctl_file() {
+  local file="$1"; shift
+  mkdir -p /etc/sysctl.d
+  : > "$file"
+  for kv in "$@"; do echo "$kv" >> "$file"; done
+  sysctl -p "$file" >/dev/null 2>&1 || true
+}
+
+enable_kernel_forward_pack() {
+  write_sysctl_file "/etc/sysctl.d/99-relay-kernel.conf" \
+    "net.ipv4.ip_forward=1" \
+    "net.ipv4.conf.all.rp_filter=0" \
+    "net.ipv4.conf.default.rp_filter=0" \
+    "net.ipv4.conf.all.accept_redirects=0" \
+    "net.ipv4.conf.default.accept_redirects=0" \
+    "net.ipv4.conf.all.send_redirects=0" \
+    "net.ipv4.conf.default.send_redirects=0"
+  ok "内核态转发与 rp_filter 设置完成"
+}
+
+compute_conntrack_max() {
+  local mem_kb; mem_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 1048576)
+  local calc=$(( mem_kb / 8 ))
+  (( calc < 262144 )) && calc=262144
+  (( calc > 2097152 )) && calc=2097152
+  echo "$calc"
+}
+
+tune_conntrack_balanced() {
+  local max; max="$(compute_conntrack_max)"
+  write_sysctl_file "/etc/sysctl.d/99-conntrack-relay.conf" \
+    "net.netfilter.nf_conntrack_max=${max}" \
+    "net.netfilter.nf_conntrack_tcp_timeout_close=10" \
+    "net.netfilter.nf_conntrack_tcp_timeout_close_wait=120" \
+    "net.netfilter.nf_conntrack_tcp_timeout_fin_wait=120" \
+    "net.netfilter.nf_conntrack_tcp_timeout_last_ack=60" \
+    "net.netfilter.nf_conntrack_tcp_timeout_syn_recv=60" \
+    "net.netfilter.nf_conntrack_tcp_timeout_syn_sent=120" \
+    "net.netfilter.nf_conntrack_tcp_timeout_time_wait=120" \
+    "net.netfilter.nf_conntrack_tcp_timeout_unacknowledged=300" \
+    "net.netfilter.nf_conntrack_tcp_timeout_established=1800" \
+    "net.netfilter.nf_conntrack_udp_timeout=60" \
+    "net.netfilter.nf_conntrack_udp_timeout_stream=300"
+  ok "conntrack（均衡）已应用，max=${max}"
+}
+
+tune_conntrack_aggressive() {
+  local max; max="$(compute_conntrack_max)"
+  write_sysctl_file "/etc/sysctl.d/99-conntrack-relay.conf" \
+    "net.netfilter.nf_conntrack_max=${max}" \
+    "net.netfilter.nf_conntrack_tcp_timeout_close=5" \
+    "net.netfilter.nf_conntrack_tcp_timeout_close_wait=30" \
+    "net.netfilter.nf_conntrack_tcp_timeout_fin_wait=30" \
+    "net.netfilter.nf_conntrack_tcp_timeout_last_ack=15" \
+    "net.netfilter.nf_conntrack_tcp_timeout_syn_recv=20" \
+    "net.netfilter.nf_conntrack_tcp_timeout_syn_sent=20" \
+    "net.netfilter.nf_conntrack_tcp_timeout_time_wait=15" \
+    "net.netfilter.nf_conntrack_tcp_timeout_unacknowledged=60" \
+    "net.netfilter.nf_conntrack_tcp_timeout_established=300" \
+    "net.netfilter.nf_conntrack_udp_timeout=10" \
+    "net.netfilter.nf_conntrack_udp_timeout_stream=60"
+  ok "conntrack（激进）已应用，max=${max}"
+}
+
+enable_tfo_optional() {
+  local yn; read -rp "  启用 TCP Fast Open (client+server)? [y/N]: " yn
+  if [[ "$yn" =~ ^[Yy]$ ]]; then
+    write_sysctl_file "/etc/sysctl.d/99-tfo.conf" "net.ipv4.tcp_fastopen=3"
+    ok "已启用 TFO（应用层需配合 TCP_FASTOPEN）"
+  else ok "跳过 TFO"; fi
+}
+
+install_guard_timer() {
+  local svc="/etc/systemd/system/relay-rules-guard.service"
+  local tim="/etc/systemd/system/relay-rules-guard.timer"
+  local script_path; script_path="$(realpath "$0" 2>/dev/null || echo "$0")"
+  cat >"$svc" <<EOF
+[Unit]
+Description=Guard: reload relay rules if table missing and update domain IPs
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'bash "$script_path" --guard-check'
+EOF
+  cat >"$tim" <<'EOF'
+[Unit]
+Description=Guard timer for relay rules (check every 1 min)
+[Timer]
+OnUnitActiveSec=1min
+AccuracySec=15s
+Unit=relay-rules-guard.service
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now relay-rules-guard.timer
+  ok "已安装并启动规则守护定时器（每分钟自检，缺失则自动重载）"
+}
+
+# ---------- top actions ----------
+one_click_kernel_conntrack() {
+  echo; echo "== 一键：内核转发 + conntrack 调优 =="
   enable_kernel_forward_pack
-  read -rp "选择 conntrack 模式 1) 均衡(默认) 2) 激进 : " m; m="${m:-1}"
-  [[ "$m" == "2" ]] && tune_conntrack_aggressive || tune_conntrack_balanced
-  if sysd_available; then read -rp "安装守护 timer（每分钟自检）? [Y/n]: " yn; [[ -z "${yn:-}" || "$yn" =~ ^[Yy]$ ]] && install_guard_timer || ok "已跳过守护"; else warn "无 systemd，可用 cron 守护"; fi
+
+  local mode; echo "选择 conntrack 模式："
+  echo "  1) 均衡（推荐）"; echo "  2) 激进（短连接密集）"
+  read -rp "请输入 1/2 [默认 1]: " mode
+  [[ -z "${mode:-}" ]] && mode=1
+  [[ "$mode" == "2" ]] && tune_conntrack_aggressive || tune_conntrack_balanced
+
+  enable_tfo_optional
+  if sysd_available; then
+    local yn; read -rp "  安装规则守护 timer（每分钟自检）? [Y/n]: " yn
+    [[ -z "${yn:-}" || "$yn" =~ ^[Yy]$ ]] && install_guard_timer || ok "已跳过守护"
+  else
+    warn "系统无 systemd：可用 cron 自行守护：*/1 * * * * nft list table ip relay_nat >/dev/null 2>&1 || nft -f /etc/relay-rules.nft"
+  fi
 }
 
-add_flow(){
-  local lport rport target rip domain snat lip self
-  while true; do read -rp "本机监听端口: " lport; validate_port "${lport:-}" && break || echo "端口非法"; done
-  while true; do read -rp "目标端口: " rport; validate_port "${rport:-}" && break || echo "端口非法"; done
-  while true; do
-    read -rp "目标地址(IPv4或域名): " target
-    if validate_ipv4 "$target"; then rip="$target"; domain=""; break
-    elif validate_domain "$target"; then domain="$target"; rip="$(resolve_domain "$domain" || true)"; [[ -n $rip ]] && { info "解析 $domain -> $rip"; break; } || echo "解析失败";
-    else echo "无效地址"; fi
-  done
-  read -rp "启用 SNAT? [Y/n 默认Y]: " yn; [[ -z "${yn:-}" || "$yn" =~ ^[Yy]$ ]] && snat=1 || snat=0
-  if [[ $snat -eq 1 ]]; then
-    # 自动探测出站源 IP 作为 SNAT 源，允许用户覆盖
-    lip="$(ip -4 route get "$rip" 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -n1 || true)"
-    while true; do read -rp "SNAT 源 IP（默认: ${lip:-请填写}）: " ans; lip="${ans:-$lip}"; validate_ipv4 "${lip:-}" && break || echo "IPv4 非法"; done
-  else lip="0.0.0.0"; fi
-  read -rp "添加 OUTPUT DNAT 以便本机自测? [y/N]: " yn; [[ $yn =~ ^[Yy]$ ]] && self=1 || self=0
-  add_rule "$lport" "$rport" "$rip" "$snat" "$lip" "$self" "$domain"
-  if sysd_available; then persist_rules_with_systemd "$RULES_FILE"; else nft -f "$RULES_FILE"; fi
-}
-
-uninstall_all(){ nft delete table ip relay_nat 2>/dev/null || true; rm -f "$RULES_FILE" "$RULES_DB"; if sysd_available; then systemctl disable --now relay-rules.service 2>/dev/null || true; rm -f /etc/systemd/system/relay-rules.service; fi; disable_guard_timer; ok "已卸载相关表/服务/文件"; }
-
-main_menu(){
+# ---------- menus ----------
+menu_root() {
   while true; do
     echo
-    echo "relay_nat（可选 SNAT）菜单："
-    echo " 1) 新增/更新 转发（可选 SNAT）"
-    echo " 2) 删除 转发（按编号）"
-    echo " 3) 查看 当前转发"
-    echo " 4) 清空 全部转发"
-    echo " 5) 重新渲染 规则"
-    echo " 6) 完全卸载"
-    echo " 7) 一键：开启转发 + conntrack 调优 + (可选)守护"
-    echo " 8) 关闭守护"
-    echo " c) 退出"
+    show_detected_ips
+    echo "nftables 转发（relay_nat）："
+    echo "  1) 新增/更新 端口转发"
+    echo "  2) 删除单条转发（可多选编号）"
+    echo "  3) 查看当前转发清单"
+    echo "  4) 清空全部转发"
+    echo "  5) 重新渲染规则"
+    echo "  6) 完全卸载（删除表/服务/文件）"
+    echo "  7) 一键开启：内核转发 + conntrack 调优 (+ 可选 TFO/守护)"
+    echo "  8) 关闭规则守护（timer）"
+    echo "  c) 退出"
     read -rp "选择: " ch
     case "$ch" in
-      1) add_flow ;;
-      2) list_rules || true; read -rp "编号(可空格/逗号分隔): " ids; delete_by_indices "$ids" ;;
-      3) list_rules || true ;;
-      4) clear_all ;;
+      1)
+        local lport rport rip lip route_lip pub selftest yn domain target_input
+        while true; do read -rp "  本机监听端口 (1-65535): " lport; validate_port "${lport:-}" && break || echo "端口非法"; done
+        while true; do read -rp "  目标端口 (1-65535): " rport; validate_port "${rport:-}" && break || echo "端口非法"; done
+        
+        while true; do
+          read -rp "  目标地址 (IPv4 或 域名，如: 192.0.2.5 或 example.com): " target_input
+          [[ -z "$target_input" ]] && { echo "地址不能为空"; continue; }
+          
+          if validate_ipv4 "$target_input"; then
+            rip="$target_input"
+            domain=""
+            break
+          elif validate_domain "$target_input"; then
+            domain="$target_input"
+            rip="$(resolve_domain "$domain" 2>/dev/null || true)"
+            if [[ -n "$rip" ]]; then
+              info "域名 $domain 解析为: $rip"
+              break
+            else
+              echo "域名解析失败，请检查域名是否有效"
+            fi
+          else
+            echo "请输入有效的IPv4地址或域名"
+          fi
+        done
+        
+        route_lip="$(ip -4 route get "$rip" 2>/dev/null | awk '/src/ {for (i=1;i<=NF;i++) if ($i=="src") print $(i+1)}' | head -n1 || true)"
+        pub="$(detect_public_ipv4 || true)"
+        echo "  探测: 公网IP(参考)=${pub:-未知}；路由出站IP=${route_lip:-未知}"
+        while true; do read -rp "  本机出口IP (用于SNAT) [默认: ${route_lip:-请手动输入}]: " lip; lip="${lip:-$route_lip}"; validate_ipv4 "${lip:-}" && break || echo "IPv4非法"; done
+        read -rp "  为本机自测添加 OUTPUT DNAT? [y/N]: " yn; [[ "${yn:-}" =~ ^[Yy]$ ]] && selftest=1 || selftest=0
+        add_relay_rule "$lport" "$rip" "$rport" "$lip" "$selftest" "$domain"
+        if sysd_available; then persist_rules_with_systemd "$RULES_FILE"; else persist_rules_without_systemd "$RULES_FILE"; fi
+        ;;
+      2) echo; if list_relay_rules; then read -rp "  请输入要删除的编号（可空格分隔，如: 1 3 5）: " ids; delete_relay_rules_by_indices "$ids"; fi ;;
+      3) echo; list_relay_rules || true ;;
+      4) clear_all_rules ;;
       5) render_rules ;;
       6) uninstall_all ;;
-      7) menu_oneclick ;;
+      7) one_click_kernel_conntrack ;;
       8) disable_guard_timer ;;
       c) exit 0 ;;
       *) echo "无效选项" ;;
@@ -184,6 +497,31 @@ main_menu(){
   done
 }
 
-# ---------- entry ----------
-if [[ "${1:-}" == "--guard-check" ]]; then guard_check; exit 0; fi
-require_root; render_rules; main_menu
+# ---------- guard check ----------
+guard_check() {
+  # 检查表是否存在，不存在则重新加载
+  if ! nft list table ip relay_nat >/dev/null 2>&1; then
+    nft -f /etc/relay-rules.nft 2>/dev/null || true
+  fi
+  
+  # 更新域名IP
+  update_domain_ips >/dev/null 2>&1 || true
+}
+
+# ---------- main ----------
+main() {
+  # 处理guard-check参数
+  if [[ "${1:-}" == "--guard-check" ]]; then
+    guard_check
+    exit 0
+  fi
+  
+  require_root
+  ensure_nft
+  enable_ip_forward
+  check_conflicts
+  # 首次渲染（即便 DB 为空也会创建表）
+  render_rules
+  menu_root
+}
+main "$@"
