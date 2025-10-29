@@ -504,11 +504,16 @@ menu_root() {
           fi
         done
         
-        route_lip="$(ip -4 route get "$rip" 2>/dev/null | awk '/src/ {for (i=1;i<=NF;i++) if ($i=="src") print $(i+1)}' | head -n1 || true)"
-        pub="$(detect_public_ipv4 || true)"
-        echo "  探测: 公网IP(参考)=${pub:-未知}；路由出站IP=${route_lip:-未知}"
-        while true; do read -rp "  本机出口IP (用于SNAT) [默认: ${route_lip:-请手动输入}]: " lip; lip="${lip:-$route_lip}"; validate_ipv4 "${lip:-}" && break || echo "IPv4非法"; done
         read -rp "  是否需要SNAT? [Y/n]: " yn; [[ -z "${yn:-}" || "${yn:-}" =~ ^[Yy]$ ]] && snat=1 || snat=0
+        
+        if [[ "$snat" == "1" ]]; then
+          route_lip="$(ip -4 route get "$rip" 2>/dev/null | awk '/src/ {for (i=1;i<=NF;i++) if ($i=="src") print $(i+1)}' | head -n1 || true)"
+          pub="$(detect_public_ipv4 || true)"
+          echo "  探测: 公网IP(参考)=${pub:-未知}；路由出站IP=${route_lip:-未知}"
+          while true; do read -rp "  本机出口IP (用于SNAT) [默认: ${route_lip:-请手动输入}]: " lip; lip="${lip:-$route_lip}"; validate_ipv4 "${lip:-}" && break || echo "IPv4非法"; done
+        else
+          lip="0.0.0.0"  # SNAT禁用时使用占位符
+        fi
         
         read -rp "  为本机自测添加 OUTPUT DNAT? [y/N]: " yn; [[ "${yn:-}" =~ ^[Yy]$ ]] && selftest=1 || selftest=0
         add_relay_rule "$lport" "$rip" "$rport" "$lip" "$selftest" "$snat" "$domain"
