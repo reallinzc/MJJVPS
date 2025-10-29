@@ -159,7 +159,7 @@ persist_rules_without_systemd() {
 
 # ---------- state & renderer ----------
 RULES_FILE=/etc/relay-rules.nft
-RULES_DB=/etc/relay-rules.db   # 每行：lport rport rip lip selftest(0/1) [domain]
+RULES_DB=/etc/relay-rules.db   # 每行：lport rport rip lip selftest(0/1) snat(0/1) [domain]
 
 render_rules() {
   local hostip; hostip="$(hostname -I 2>/dev/null | awk '{print $1}')"
@@ -171,12 +171,19 @@ render_rules() {
     echo "  chain OUTPUT      { type nat hook output      priority -100; policy accept; }"
     echo "}"
     if [[ -s $RULES_DB ]]; then
-      while read -r lport rport rip lip selftest domain; do
+      while read -r lport rport rip lip selftest snat domain; do
         [[ -z "$lport" || "$lport" == \#* ]] && continue
+        # 如果只有5个字段，将snat设为1（兼容旧格式）
+        if [[ -z "$snat" ]]; then
+          snat="${domain:-1}"
+          domain=""
+        fi
         echo "add rule ip relay_nat PREROUTING tcp dport $lport counter dnat to $rip:$rport"
         echo "add rule ip relay_nat PREROUTING udp dport $lport counter dnat to $rip:$rport"
-        echo "add rule ip relay_nat POSTROUTING ip daddr $rip tcp dport $rport counter snat to $lip"
-        echo "add rule ip relay_nat POSTROUTING ip daddr $rip udp dport $rport counter snat to $lip"
+        if [[ "${snat:-1}" == "1" ]]; then
+          echo "add rule ip relay_nat POSTROUTING ip daddr $rip tcp dport $rport counter snat to $lip"
+          echo "add rule ip relay_nat POSTROUTING ip daddr $rip udp dport $rport counter snat to $lip"
+        fi
         if [[ "${selftest:-0}" == "1" ]]; then
           if [[ -n "$hostip" ]]; then
             echo "add rule ip relay_nat OUTPUT ip daddr $hostip tcp dport $lport counter dnat to $rip:$rport"
@@ -199,19 +206,21 @@ render_rules() {
 }
 
 add_relay_rule() {
-  local lport="$1" rip="$2" rport="$3" lip="$4" selftest="${5:-0}" domain="${6:-}"
+  local lport="$1" rip="$2" rport="$3" lip="$4" selftest="${5:-0}" snat="${6:-1}" domain="${7:-}"
   mkdir -p "$(dirname "$RULES_DB")"; touch "$RULES_DB"
   local tmpf; tmpf="$(mktemp)"
   awk -v l="$lport" -v r="$rport" -v ip="$rip" '!(NF>=5 && $1==l && $2==r && $3==ip){print $0}' "$RULES_DB" > "$tmpf"
   mv "$tmpf" "$RULES_DB"
   if [[ -n "$domain" ]]; then
-    echo "$lport $rport $rip $lip $selftest $domain" >> "$RULES_DB"
+    echo "$lport $rport $rip $lip $selftest $snat $domain" >> "$RULES_DB"
     render_rules
-    ok "已添加/更新: $lport -> $domain($rip):$rport (SNAT: $lip, selftest=$selftest)"
+    local snat_text; [[ "$snat" == "1" ]] && snat_text="$lip" || snat_text="disabled"
+    ok "已添加/更新: $lport -> $domain($rip):$rport (SNAT: $snat_text, selftest=$selftest)"
   else
-    echo "$lport $rport $rip $lip $selftest" >> "$RULES_DB"
+    echo "$lport $rport $rip $lip $selftest $snat" >> "$RULES_DB"
     render_rules
-    ok "已添加/更新: $lport -> $rip:$rport (SNAT: $lip, selftest=$selftest)"
+    local snat_text; [[ "$snat" == "1" ]] && snat_text="$lip" || snat_text="disabled"
+    ok "已添加/更新: $lport -> $rip:$rport (SNAT: $snat_text, selftest=$selftest)"
   fi
 }
 
@@ -221,11 +230,26 @@ list_relay_rules() {
     echo "（当前无转发项）"
     return 1
   fi
-  printf "%-4s %-8s %-22s %-16s %-8s %-15s\n" "#" "LPORT" "REMOTE(RIP:RPORT)" "SNAT(LIP)" "SELFTEST" "DOMAIN"
+  printf "%-4s %-8s %-22s %-16s %-8s %-8s %-15s\n" "#" "LPORT" "REMOTE(RIP:RPORT)" "SNAT(LIP)" "SELFTEST" "SNAT" "DOMAIN"
   nl -w2 -s' ' "$RULES_DB" | awk '
-    NF>=6{
+    NF>=7{
+      idx=$1; lport=$2; rport=$3; rip=$4; lip=$5; self=$6; snat_flag=$7; domain=$8
+      snat_text = (snat_flag=="1" ? lip : "disabled")
+      printf "%-4s %-8s %-22s %-16s %-8s %-8s %-15s\n", idx, lport, rip":"rport, snat_text, (self=="1"?"yes":"no"), (snat_flag=="1"?"yes":"no"), (domain?domain:"")
+    }
+    NF==6{
       idx=$1; lport=$2; rport=$3; rip=$4; lip=$5; self=$6; domain=$7
-      printf "%-4s %-8s %-22s %-16s %-8s %-15s\n", idx, lport, rip":"rport, lip, (self=="1"?"yes":"no"), (domain?domain:"")
+      if (domain ~ /^[01]$/) {
+        snat_flag = domain; domain = ""
+      } else {
+        snat_flag = "1"
+      }
+      snat_text = (snat_flag=="1" ? lip : "disabled")
+      printf "%-4s %-8s %-22s %-16s %-8s %-8s %-15s\n", idx, lport, rip":"rport, snat_text, (self=="1"?"yes":"no"), (snat_flag=="1"?"yes":"no"), (domain?domain:"")
+    }
+    NF==5{
+      idx=$1; lport=$2; rport=$3; rip=$4; lip=$5; self=$6
+      printf "%-4s %-8s %-22s %-16s %-8s %-8s %-15s\n", idx, lport, rip":"rport, lip, (self=="1"?"yes":"no"), "yes", ""
     }'
   return 0
 }
@@ -256,17 +280,29 @@ update_domain_ips() {
   local tmpf; tmpf="$(mktemp)"
   local updated=0
   
-  while read -r lport rport rip lip selftest domain; do
-    [[ -z "$lport" || "$lport" == \#* ]] && { echo "$lport $rport $rip $lip $selftest $domain" >> "$tmpf"; continue; }
-    [[ -z "$domain" || "${#domain}" -eq 0 ]] && { echo "$lport $rport $rip $lip $selftest" >> "$tmpf"; continue; }
+  while read -r lport rport rip lip selftest snat domain; do
+    [[ -z "$lport" || "$lport" == \#* ]] && { echo "$lport $rport $rip $lip $selftest $snat $domain" >> "$tmpf"; continue; }
+    
+    # 兼容旧格式
+    if [[ -z "$domain" ]]; then
+      if [[ "$snat" != "0" && "$snat" != "1" ]]; then
+        domain="$snat"
+        snat="1"
+      else
+        echo "$lport $rport $rip $lip $selftest $snat" >> "$tmpf"
+        continue
+      fi
+    fi
+    
+    [[ -z "$domain" || "${#domain}" -eq 0 ]] && { echo "$lport $rport $rip $lip $selftest $snat" >> "$tmpf"; continue; }
     
     local new_ip; new_ip="$(resolve_domain "$domain" 2>/dev/null || echo "$rip")"
     if [[ "$new_ip" != "$rip" && -n "$new_ip" ]]; then
-      echo "$lport $rport $new_ip $lip $selftest $domain" >> "$tmpf"
+      echo "$lport $rport $new_ip $lip $selftest $snat $domain" >> "$tmpf"
       info "域名 $domain IP更新: $rip -> $new_ip"
       ((updated++))
     else
-      echo "$lport $rport $rip $lip $selftest $domain" >> "$tmpf"
+      echo "$lport $rport $rip $lip $selftest $snat $domain" >> "$tmpf"
     fi
   done < "$RULES_DB"
   
@@ -378,13 +414,6 @@ tune_conntrack_aggressive() {
   ok "conntrack（激进）已应用，max=${max}"
 }
 
-enable_tfo_optional() {
-  local yn; read -rp "  启用 TCP Fast Open (client+server)? [y/N]: " yn
-  if [[ "$yn" =~ ^[Yy]$ ]]; then
-    write_sysctl_file "/etc/sysctl.d/99-tfo.conf" "net.ipv4.tcp_fastopen=3"
-    ok "已启用 TFO（应用层需配合 TCP_FASTOPEN）"
-  else ok "跳过 TFO"; fi
-}
 
 install_guard_timer() {
   local svc="/etc/systemd/system/relay-rules-guard.service"
@@ -423,7 +452,6 @@ one_click_kernel_conntrack() {
   [[ -z "${mode:-}" ]] && mode=1
   [[ "$mode" == "2" ]] && tune_conntrack_aggressive || tune_conntrack_balanced
 
-  enable_tfo_optional
   if sysd_available; then
     local yn; read -rp "  安装规则守护 timer（每分钟自检）? [Y/n]: " yn
     [[ -z "${yn:-}" || "$yn" =~ ^[Yy]$ ]] && install_guard_timer || ok "已跳过守护"
@@ -444,13 +472,13 @@ menu_root() {
     echo "  4) 清空全部转发"
     echo "  5) 重新渲染规则"
     echo "  6) 完全卸载（删除表/服务/文件）"
-    echo "  7) 一键开启：内核转发 + conntrack 调优 (+ 可选 TFO/守护)"
+    echo "  7) 一键开启：内核转发 + conntrack 调优 (+ 可选守护)"
     echo "  8) 关闭规则守护（timer）"
     echo "  c) 退出"
     read -rp "选择: " ch
     case "$ch" in
       1)
-        local lport rport rip lip route_lip pub selftest yn domain target_input
+        local lport rport rip lip route_lip pub selftest snat yn domain target_input
         while true; do read -rp "  本机监听端口 (1-65535): " lport; validate_port "${lport:-}" && break || echo "端口非法"; done
         while true; do read -rp "  目标端口 (1-65535): " rport; validate_port "${rport:-}" && break || echo "端口非法"; done
         
@@ -480,8 +508,10 @@ menu_root() {
         pub="$(detect_public_ipv4 || true)"
         echo "  探测: 公网IP(参考)=${pub:-未知}；路由出站IP=${route_lip:-未知}"
         while true; do read -rp "  本机出口IP (用于SNAT) [默认: ${route_lip:-请手动输入}]: " lip; lip="${lip:-$route_lip}"; validate_ipv4 "${lip:-}" && break || echo "IPv4非法"; done
+        read -rp "  是否需要SNAT? [Y/n]: " yn; [[ -z "${yn:-}" || "${yn:-}" =~ ^[Yy]$ ]] && snat=1 || snat=0
+        
         read -rp "  为本机自测添加 OUTPUT DNAT? [y/N]: " yn; [[ "${yn:-}" =~ ^[Yy]$ ]] && selftest=1 || selftest=0
-        add_relay_rule "$lport" "$rip" "$rport" "$lip" "$selftest" "$domain"
+        add_relay_rule "$lport" "$rip" "$rport" "$lip" "$selftest" "$snat" "$domain"
         if sysd_available; then persist_rules_with_systemd "$RULES_FILE"; else persist_rules_without_systemd "$RULES_FILE"; fi
         ;;
       2) echo; if list_relay_rules; then read -rp "  请输入要删除的编号（可空格分隔，如: 1 3 5）: " ids; delete_relay_rules_by_indices "$ids"; fi ;;
